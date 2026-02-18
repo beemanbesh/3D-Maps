@@ -1,0 +1,224 @@
+---
+# =============================================================================
+# Blue-Green Rollback Job
+# 3D Development Visualization Platform
+# =============================================================================
+# This Job reverts the backend and frontend Service selectors to the previous
+# slot. It reads the devplatform.io/previous-slot annotation from the backend
+# Service and patches both services to point back to that slot.
+#
+# Usage:
+#   kubectl apply -f k8s/blue-green/rollback.yaml
+#
+# The Job uses a ServiceAccount with permissions to read and patch Services
+# in the devplatform namespace.
+#
+# After the Job completes, verify with:
+#   kubectl get svc backend frontend -n devplatform \
+#     -o jsonpath='{range .items[*]}{.metadata.name}: {.spec.selector.slot}{"\n"}{end}'
+# =============================================================================
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: deploy-rollback-sa
+  namespace: devplatform
+  labels:
+    app.kubernetes.io/name: deploy-rollback
+    app.kubernetes.io/component: deployment
+    app.kubernetes.io/part-of: 3d-development-platform
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: deploy-rollback-role
+  namespace: devplatform
+  labels:
+    app.kubernetes.io/name: deploy-rollback
+    app.kubernetes.io/component: deployment
+    app.kubernetes.io/part-of: 3d-development-platform
+rules:
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "patch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: deploy-rollback-binding
+  namespace: devplatform
+  labels:
+    app.kubernetes.io/name: deploy-rollback
+    app.kubernetes.io/component: deployment
+    app.kubernetes.io/part-of: 3d-development-platform
+subjects:
+  - kind: ServiceAccount
+    name: deploy-rollback-sa
+    namespace: devplatform
+roleRef:
+  kind: Role
+  name: deploy-rollback-role
+  apiGroup: rbac.authorization.k8s.io
+
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: blue-green-rollback
+  namespace: devplatform
+  labels:
+    app.kubernetes.io/name: deploy-rollback
+    app.kubernetes.io/component: deployment
+    app.kubernetes.io/part-of: 3d-development-platform
+  annotations:
+    devplatform.io/description: "Reverts blue-green service selectors to the previous slot"
+spec:
+  # Do not retry on failure -- rollback should be investigated manually
+  backoffLimit: 1
+  # Clean up completed Job after 10 minutes
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: deploy-rollback
+        app.kubernetes.io/component: deployment
+    spec:
+      serviceAccountName: deploy-rollback-sa
+      restartPolicy: Never
+      containers:
+        - name: rollback
+          image: bitnami/kubectl:latest
+          command:
+            - /bin/bash
+            - -euo
+            - pipefail
+            - -c
+            - |
+              echo "=== Blue-Green Rollback Job ==="
+              echo "Namespace: devplatform"
+              echo "Timestamp: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+              echo ""
+
+              # ---------------------------------------------------------------
+              # Step 1: Read the previous slot from the backend Service
+              # ---------------------------------------------------------------
+              PREVIOUS_SLOT=$(kubectl get svc backend -n devplatform \
+                -o jsonpath='{.metadata.annotations.devplatform\.io/previous-slot}')
+
+              CURRENT_SLOT=$(kubectl get svc backend -n devplatform \
+                -o jsonpath='{.spec.selector.slot}')
+
+              echo "Current active slot: $CURRENT_SLOT"
+              echo "Previous slot:       $PREVIOUS_SLOT"
+
+              if [ -z "$PREVIOUS_SLOT" ]; then
+                echo "ERROR: No previous slot annotation found on backend Service."
+                echo "Cannot determine rollback target."
+                echo "Manual intervention required:"
+                echo "  kubectl patch svc backend -n devplatform -p '{\"spec\":{\"selector\":{\"slot\":\"blue\"}}}'"
+                exit 1
+              fi
+
+              if [ "$PREVIOUS_SLOT" = "$CURRENT_SLOT" ]; then
+                echo "WARNING: Previous slot is the same as current slot ($CURRENT_SLOT)."
+                echo "No rollback action needed."
+                exit 0
+              fi
+
+              # ---------------------------------------------------------------
+              # Step 2: Verify the previous slot has healthy pods
+              # ---------------------------------------------------------------
+              echo ""
+              echo "Checking that $PREVIOUS_SLOT slot has ready pods..."
+
+              READY_PODS=$(kubectl get pods -n devplatform \
+                -l "app.kubernetes.io/name=backend,slot=$PREVIOUS_SLOT" \
+                -o jsonpath='{.items[*].status.conditions[?(@.type=="Ready")].status}' | tr ' ' '\n' | grep -c "True" || echo "0")
+
+              echo "Ready pods in $PREVIOUS_SLOT slot: $READY_PODS"
+
+              if [ "$READY_PODS" -eq 0 ]; then
+                echo "ERROR: No ready pods found in $PREVIOUS_SLOT slot."
+                echo "Rollback target is not healthy. Aborting."
+                exit 1
+              fi
+
+              # ---------------------------------------------------------------
+              # Step 3: Patch the backend Service selector
+              # ---------------------------------------------------------------
+              echo ""
+              echo "Patching backend Service: slot=$CURRENT_SLOT -> slot=$PREVIOUS_SLOT"
+
+              kubectl patch svc backend -n devplatform --type=merge -p \
+                "{
+                  \"spec\": {
+                    \"selector\": {
+                      \"slot\": \"$PREVIOUS_SLOT\"
+                    }
+                  },
+                  \"metadata\": {
+                    \"annotations\": {
+                      \"devplatform.io/active-slot\": \"$PREVIOUS_SLOT\",
+                      \"devplatform.io/previous-slot\": \"$CURRENT_SLOT\",
+                      \"devplatform.io/last-switch\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",
+                      \"devplatform.io/switch-reason\": \"rollback\"
+                    }
+                  }
+                }"
+
+              echo "Backend Service patched successfully."
+
+              # ---------------------------------------------------------------
+              # Step 4: Patch the frontend Service selector
+              # ---------------------------------------------------------------
+              echo ""
+              echo "Patching frontend Service: slot=$CURRENT_SLOT -> slot=$PREVIOUS_SLOT"
+
+              kubectl patch svc frontend -n devplatform --type=merge -p \
+                "{
+                  \"spec\": {
+                    \"selector\": {
+                      \"slot\": \"$PREVIOUS_SLOT\"
+                    }
+                  },
+                  \"metadata\": {
+                    \"annotations\": {
+                      \"devplatform.io/active-slot\": \"$PREVIOUS_SLOT\",
+                      \"devplatform.io/previous-slot\": \"$CURRENT_SLOT\",
+                      \"devplatform.io/last-switch\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",
+                      \"devplatform.io/switch-reason\": \"rollback\"
+                    }
+                  }
+                }"
+
+              echo "Frontend Service patched successfully."
+
+              # ---------------------------------------------------------------
+              # Step 5: Verify the switch
+              # ---------------------------------------------------------------
+              echo ""
+              echo "=== Verification ==="
+
+              BACKEND_SLOT=$(kubectl get svc backend -n devplatform \
+                -o jsonpath='{.spec.selector.slot}')
+              FRONTEND_SLOT=$(kubectl get svc frontend -n devplatform \
+                -o jsonpath='{.spec.selector.slot}')
+
+              echo "Backend Service selector:  slot=$BACKEND_SLOT"
+              echo "Frontend Service selector: slot=$FRONTEND_SLOT"
+
+              if [ "$BACKEND_SLOT" = "$PREVIOUS_SLOT" ] && [ "$FRONTEND_SLOT" = "$PREVIOUS_SLOT" ]; then
+                echo ""
+                echo "=== ROLLBACK COMPLETE ==="
+                echo "Traffic is now routed to the $PREVIOUS_SLOT slot."
+                echo "The $CURRENT_SLOT slot is still running for inspection."
+              else
+                echo ""
+                echo "WARNING: Verification mismatch. Please check services manually."
+                exit 1
+              fi

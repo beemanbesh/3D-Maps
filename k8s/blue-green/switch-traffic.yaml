@@ -1,0 +1,87 @@
+---
+# =============================================================================
+# Backend Service — Blue-Green Traffic Switching
+# 3D Development Visualization Platform
+# =============================================================================
+# This Service definition controls which slot (blue or green) receives live
+# traffic. The key field is spec.selector.slot -- set it to "blue" or "green"
+# to direct traffic to the corresponding Deployment.
+#
+# To switch traffic:
+#   kubectl apply -f k8s/blue-green/switch-traffic.yaml
+#
+# Or patch directly:
+#   kubectl patch svc backend -n devplatform \
+#     -p '{"spec":{"selector":{"slot":"green"}}}'
+#
+# The annotation devplatform.io/previous-slot tracks the last active slot
+# for rollback purposes.
+# =============================================================================
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend
+  namespace: devplatform
+  labels:
+    app.kubernetes.io/name: backend
+    app.kubernetes.io/component: api
+    app.kubernetes.io/part-of: 3d-development-platform
+    app.kubernetes.io/managed-by: deploy-script
+  annotations:
+    devplatform.io/deployment-strategy: blue-green
+    # -----------------------------------------------------------------------
+    # CHANGE THIS VALUE to switch traffic between blue and green.
+    # Valid values: "blue" or "green"
+    # -----------------------------------------------------------------------
+    devplatform.io/active-slot: "blue"
+    devplatform.io/previous-slot: ""
+    devplatform.io/last-switch: ""
+spec:
+  type: ClusterIP
+  # ---------------------------------------------------------------------------
+  # The slot selector determines which Deployment receives traffic.
+  # Change "blue" to "green" (or vice versa) to switch.
+  # ---------------------------------------------------------------------------
+  selector:
+    app.kubernetes.io/name: backend
+    slot: blue
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+      protocol: TCP
+
+---
+# =============================================================================
+# Frontend Service — Blue-Green Traffic Switching
+# =============================================================================
+# Mirrors the backend service pattern for the frontend. Both services should
+# be switched together during a deployment.
+# =============================================================================
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+  namespace: devplatform
+  labels:
+    app.kubernetes.io/name: frontend
+    app.kubernetes.io/component: web
+    app.kubernetes.io/part-of: 3d-development-platform
+    app.kubernetes.io/managed-by: deploy-script
+  annotations:
+    devplatform.io/deployment-strategy: blue-green
+    devplatform.io/active-slot: "blue"
+    devplatform.io/previous-slot: ""
+    devplatform.io/last-switch: ""
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: frontend
+    slot: blue
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80
+      protocol: TCP

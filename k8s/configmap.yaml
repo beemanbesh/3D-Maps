@@ -1,0 +1,27 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: devplatform-config
+  namespace: devplatform
+  labels:
+    app.kubernetes.io/name: devplatform-config
+    app.kubernetes.io/component: configuration
+    app.kubernetes.io/part-of: 3d-development-platform
+data:
+  # Database connection (password injected via secret env var at runtime)
+  DATABASE_URL: "postgresql+asyncpg://devuser:$(POSTGRES_PASSWORD)@postgres:5432/dev_platform"
+  DATABASE_URL_SYNC: "postgresql://devuser:$(POSTGRES_PASSWORD)@postgres:5432/dev_platform"
+
+  # Redis
+  REDIS_URL: "redis://redis:6379/0"
+
+  # MinIO / S3-compatible storage
+  S3_ENDPOINT_URL: "http://minio:9000"
+  S3_BUCKET_NAME: "dev-platform-uploads"
+
+  # CORS
+  CORS_ORIGINS: "https://devplatform.example.com"
+
+  # JWT
+  JWT_ALGORITHM: "HS256"

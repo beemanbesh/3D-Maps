@@ -43,3 +43,5 @@ htmlcov/
 *.glb
 *.gltf
 uploads/
+nul
+docx_extracted.txt

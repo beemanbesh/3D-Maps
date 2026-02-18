@@ -1,0 +1,153 @@
+# =============================================================================
+# Docker Compose — Staging Overrides
+# Usage: docker compose -f docker-compose.yml -f docker-compose.staging.yml up -d
+# =============================================================================
+
+services:
+  # ---------------------------------------------------------------------------
+  # PostgreSQL with PostGIS — Staging
+  # ---------------------------------------------------------------------------
+  db:
+    restart: always
+    environment:
+      POSTGRES_DB: dev_platform
+      POSTGRES_USER: ${POSTGRES_USER:-devuser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+    networks:
+      - staging
+
+  # ---------------------------------------------------------------------------
+  # Redis — Staging
+  # ---------------------------------------------------------------------------
+  redis:
+    restart: always
+    command: >
+      redis-server
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+      --appendonly yes
+    networks:
+      - staging
+
+  # ---------------------------------------------------------------------------
+  # MinIO — Staging
+  # ---------------------------------------------------------------------------
+  minio:
+    restart: always
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - staging
+
+  # ---------------------------------------------------------------------------
+  # Backend API — Staging
+  # ---------------------------------------------------------------------------
+  backend:
+    restart: always
+    # Remove the dev-only container_name so replicas can be created
+    container_name: ""
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 2
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-devuser}:${POSTGRES_PASSWORD}@db:5432/dev_platform
+      - DATABASE_URL_SYNC=postgresql://${POSTGRES_USER:-devuser}:${POSTGRES_PASSWORD}@db:5432/dev_platform
+      - REDIS_URL=redis://redis:6379/0
+      - S3_ENDPOINT_URL=http://minio:9000
+      - S3_ACCESS_KEY=${MINIO_ROOT_USER:-minioadmin}
+      - S3_SECRET_KEY=${MINIO_ROOT_PASSWORD}
+      - S3_BUCKET_NAME=dev-platform-uploads
+      - APP_ENV=staging
+      - APP_DEBUG=false
+    volumes: []  # Override: no bind mounts in staging
+    deploy:
+      replicas: 2
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    networks:
+      - staging
+
+  # ---------------------------------------------------------------------------
+  # Celery Worker — Staging
+  # ---------------------------------------------------------------------------
+  celery-worker:
+    restart: always
+    container_name: ""
+    command: celery -A app.tasks.worker worker --loglevel=warning --concurrency=4
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-devuser}:${POSTGRES_PASSWORD}@db:5432/dev_platform
+      - DATABASE_URL_SYNC=postgresql://${POSTGRES_USER:-devuser}:${POSTGRES_PASSWORD}@db:5432/dev_platform
+      - REDIS_URL=redis://redis:6379/0
+      - S3_ENDPOINT_URL=http://minio:9000
+      - S3_ACCESS_KEY=${MINIO_ROOT_USER:-minioadmin}
+      - S3_SECRET_KEY=${MINIO_ROOT_PASSWORD}
+      - S3_BUCKET_NAME=dev-platform-uploads
+    volumes: []
+    healthcheck:
+      test: ["CMD", "celery", "-A", "app.tasks.worker", "inspect", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    networks:
+      - staging
+
+  # ---------------------------------------------------------------------------
+  # Frontend — Staging (production build served by Vite preview or static)
+  # ---------------------------------------------------------------------------
+  frontend:
+    restart: always
+    container_name: ""
+    build:
+      context: ./frontend
+      dockerfile: ../infrastructure/docker/Dockerfile.frontend
+      args:
+        NODE_ENV: production
+    command: npm run preview -- --host 0.0.0.0 --port 5173
+    environment:
+      - VITE_API_URL=/api
+      - VITE_MAPBOX_TOKEN=${MAPBOX_ACCESS_TOKEN}
+      - VITE_SENTRY_DSN=${SENTRY_DSN_FRONTEND:-}
+    volumes: []
+    networks:
+      - staging
+
+  # ---------------------------------------------------------------------------
+  # Nginx Reverse Proxy — Staging
+  # ---------------------------------------------------------------------------
+  nginx:
+    image: nginx:alpine
+    container_name: devplatform-nginx
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./infrastructure/nginx/staging.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - backend
+      - frontend
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:80/"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    networks:
+      - staging
+
+networks:
+  staging:
+    driver: bridge
+    name: devplatform-staging
